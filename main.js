@@ -10,6 +10,9 @@ const QUALITY = {
   dust: true, // floating dust motes that catch the light
   lightShafts: true, // soft volumetric shafts under the skylights
   msaaSamples: 4, // 1 disables MSAA
+  reflections: true, // live reflection probe in the polished floor. The most
+  //                    GPU-heavy feature here — set false first if FPS drops.
+  reflectionRefresh: 4, // frames between probe re-renders (higher = cheaper)
 };
 
 const canvas = document.querySelector("#game");
@@ -21,10 +24,13 @@ const engine = new BABYLON.Engine(canvas, true, {
 const scene = new BABYLON.Scene(engine);
 scene.clearColor = new BABYLON.Color4(0.03, 0.034, 0.04, 1);
 scene.collisionsEnabled = true;
+// We only raycast on click / [E], never on raw pointer movement — skipping the
+// per-move pick is a free win now that the world holds many more meshes.
+scene.skipPointerMovePicking = true;
 scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
 // Cooler, slightly lifted haze reads as atmospheric distance rather than a black void.
 scene.fogColor = new BABYLON.Color3(0.052, 0.058, 0.069);
-scene.fogDensity = 0.0036;
+scene.fogDensity = 0.0052;
 
 // ACES filmic tone mapping is the difference between "3D render" and "photograph".
 // It tames blown-out lights and gives the whole scene a believable response curve.
@@ -456,7 +462,7 @@ if (QUALITY.shadows && BABYLON.CascadedShadowGenerator) {
   shadowGen.filteringQuality = BABYLON.ShadowGenerator.QUALITY_MEDIUM;
   shadowGen.bias = 0.012;
   shadowGen.normalBias = 0.025;
-  shadowGen.setDarkness(0.42);
+  shadowGen.setDarkness(0.36);
 }
 
 // Names of "hero" structural props worth the cost of casting real shadows, and
@@ -475,13 +481,16 @@ const flashlight = new BABYLON.SpotLight(
   "flashlight",
   camera.position,
   camera.getForwardRay().direction,
-  Math.PI / 4,
-  4,
+  Math.PI / 3.4,
+  6,
   scene,
 );
 flashlight.intensity = 1.55;
 flashlight.diffuse = new BABYLON.Color3(1, 0.93, 0.72);
 flashlight.specular = new BABYLON.Color3(1, 0.95, 0.8);
+// Soft hotspot-to-edge falloff so the beam fades like a real torch instead of
+// stamping a hard-edged circle on every surface.
+flashlight.innerAngle = Math.PI / 7;
 flashlight.parent = camera;
 
 // --- Post-processing ------------------------------------------------------
@@ -494,9 +503,16 @@ pipeline.fxaaEnabled = true;
 
 pipeline.bloomEnabled = true;
 pipeline.bloomThreshold = 0.82;
-pipeline.bloomWeight = 0.45;
-pipeline.bloomKernel = 64;
-pipeline.bloomScale = 0.6;
+pipeline.bloomWeight = 0.42;
+pipeline.bloomKernel = 80;
+pipeline.bloomScale = 0.7;
+
+// A whisper of chromatic aberration toward the edges — the subtle colour
+// fringing a real lens produces. Kept low so it reads as "shot on a camera",
+// not as a defect.
+pipeline.chromaticAberrationEnabled = true;
+pipeline.chromaticAberration.aberrationAmount = 7;
+pipeline.chromaticAberration.radialIntensity = 0.7;
 
 pipeline.imageProcessing.toneMappingEnabled = true;
 pipeline.imageProcessing.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
@@ -561,6 +577,22 @@ if (QUALITY.dust) {
   dust.maxEmitPower = 0.08;
   dust.updateSpeed = 0.02;
   dust.start();
+}
+
+// --- Live floor reflections ----------------------------------------------
+// A reflection probe re-renders the surroundings into a cube map a few times a
+// second; the polished floor samples it, so columns, shopfronts, signage and
+// lights now reflect for real instead of mirroring a flat IBL gradient. It
+// follows the player and renders the whole streamed world (renderList = null),
+// which is why it's the single most expensive switch in the QUALITY block.
+let floorProbe = null;
+if (QUALITY.reflections && BABYLON.ReflectionProbe) {
+  floorProbe = new BABYLON.ReflectionProbe("floorProbe", 128, scene);
+  floorProbe.renderList = null; // render every (active) mesh, including streamed tiles
+  floorProbe.refreshRate = Math.max(1, QUALITY.reflectionRefresh | 0);
+  floorProbe.position.copyFrom(camera.position);
+  materials.marble.reflectionTexture = floorProbe.cubeTexture;
+  materials.marble.environmentIntensity = 1.0;
 }
 
 
@@ -1223,6 +1255,12 @@ function finalizeTile(root) {
           item.receiveShadows = true;
         }
       }
+      // Only the floor (build placement) and lootable props need to answer
+      // raycasts; making everything else unpickable speeds up every E-press
+      // and click across a world that now holds far more meshes.
+      item.isPickable = item.name === "floor" || interactables.has(item);
+      // Cheaper frustum test — the scene is overwhelmingly small/medium props.
+      item.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_BOUNDINGSPHERE_ONLY;
       item.freezeWorldMatrix();
     }
   }
@@ -1278,19 +1316,36 @@ function addAtriumVoidFloor(root, x, z, hole = 11) {
 }
 
 // Waist-high glass balustrade around the atrium opening.
-function addVoidRails(root, x, z, hole = 11) {
+// Glass balustrade around the atrium opening. The escalator bridges the void
+// from the -Z edge up to the +Z edge, so we leave a gap in those two rails for
+// it to pass through; the +X / -X rails stay solid.
+function addVoidRails(root, x, z, hole = 11, gap = 3.0) {
   const h = hole / 2;
-  const specs = [
-    { w: hole + 0.3, d: 0.1, cx: 0, cz: -h },
-    { w: hole + 0.3, d: 0.1, cx: 0, cz: h },
-    { w: 0.1, d: hole + 0.3, cx: -h, cz: 0 },
-    { w: 0.1, d: hole + 0.3, cx: h, cz: 0 },
-  ];
-  for (const s of specs) {
-    root.push(createBox("glassRail", { width: s.w, height: 0.92, depth: s.d }, new BABYLON.Vector3(x + s.cx, 0.55, z + s.cz), materials.railGlass, true));
-    root.push(createBox("railTopCap", { width: s.w + 0.12, height: 0.08, depth: s.d + 0.06 }, new BABYLON.Vector3(x + s.cx, 1.04, z + s.cz), materials.chrome, false));
-    root.push(createBox("railBottomTrack", { width: s.w + 0.08, height: 0.06, depth: s.d + 0.04 }, new BABYLON.Vector3(x + s.cx, 0.12, z + s.cz), materials.blackTrim, false));
+  const W = hole + 0.3;
+  const seg = (W - gap) / 2;
+  const segOff = gap / 2 + seg / 2;
+
+  function railBox(name, w, height, d, cx, cy, cz, mat, collide) {
+    root.push(createBox(name, { width: w, height, depth: d }, new BABYLON.Vector3(x + cx, cy, z + cz), mat, collide));
   }
+  function fullSide(d, cx, cz) {
+    railBox("glassRail", d === 0.1 ? W : 0.1, 0.92, d === 0.1 ? 0.1 : W, cx, 0.55, cz, materials.railGlass, true);
+    railBox("railTopCap", d === 0.1 ? W + 0.12 : 0.16, 0.08, d === 0.1 ? 0.16 : W + 0.12, cx, 1.04, cz, materials.chrome, false);
+    railBox("railBottomTrack", d === 0.1 ? W + 0.08 : 0.14, 0.06, d === 0.1 ? 0.14 : W + 0.08, cx, 0.12, cz, materials.blackTrim, false);
+  }
+  function gappedZSide(cz) {
+    for (const sx of [-segOff, segOff]) {
+      railBox("glassRail", seg, 0.92, 0.1, sx, 0.55, cz, materials.railGlass, true);
+      railBox("railTopCap", seg + 0.12, 0.08, 0.16, sx, 1.04, cz, materials.chrome, false);
+      railBox("railBottomTrack", seg + 0.08, 0.06, 0.14, sx, 0.12, cz, materials.blackTrim, false);
+      // newel post capping the rail at the opening edge
+      railBox("railTopCap", 0.12, 1.0, 0.12, sx - Math.sign(sx) * (seg / 2), 0.5, cz, materials.chrome, false);
+    }
+  }
+  gappedZSide(-h); // boarding edge
+  gappedZSide(h); // alighting edge
+  fullSide(W, -h, 0); // -X side (full)
+  fullSide(W, h, 0); // +X side (full)
 }
 
 function addCeiling(root, x, z) {
@@ -1361,27 +1416,31 @@ function addEscalator(root, x, z, rise = levelHeight, angle = 0) {
   ramp.receiveShadows = true;
   root.push(ramp);
 
-  // small flat landings so you step on/off cleanly
-  const botLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, -0.4, 0.12), materials.scrap, true);
-  const topLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, run + 0.4, rise + 0.12), materials.scrap, true);
+  // small flat landings so you step on/off cleanly, sat flush with the ramp ends
+  const botLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, -0.4, 0.06), materials.scrap, true);
+  const topLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, run + 0.4, rise + 0.06), materials.scrap, true);
   botLanding.rotation.y = angle;
   topLanding.rotation.y = angle;
   root.push(botLanding, topLanding);
 
-  // decorative step ribs running up the slope
-  const stepCount = Math.max(8, Math.round(slopeLen / 0.5));
+  // step treads sitting flush on the ramp surface (the ramp's top face is
+  // ~0.16 above its centreline once thickness and slope are accounted for).
+  const surfaceLift = 0.19 * Math.cos(pitch);
+  const stepCount = Math.max(10, Math.round(slopeLen / 0.42));
   for (let i = 1; i < stepCount; i++) {
     const t = i / stepCount;
-    const p = localPoint(x, z, angle, 0, run * t, rise * t + 0.22);
-    const rib = createBox("stepRib", { width: 2.05, height: 0.03, depth: 0.07 }, p, materials.chrome, false);
-    rib.rotation.y = angle;
-    root.push(rib);
+    const p = localPoint(x, z, angle, 0, run * t, rise * t + surfaceLift - 0.015);
+    const tread = createBox("stepRib", { width: 1.95, height: 0.05, depth: 0.16 }, p, materials.chrome, false);
+    tread.rotation.y = angle;
+    root.push(tread);
   }
 
-  // glass balustrades + rubber handrails down both sides
+  // glass balustrades + rubber handrails down both sides. The glass is
+  // collidable now: the escalator spans open void, so its sides are the only
+  // thing between the player and the drop.
   for (const side of [-1, 1]) {
     const gc = localPoint(x, z, angle, side * 1.2, halfFwd, rise / 2 + 0.62);
-    const glass = createBox("escalatorGlass", { width: 0.08, height: 1.0, depth: slopeLen }, gc, materials.railGlass, false);
+    const glass = createBox("escalatorGlass", { width: 0.08, height: 1.0, depth: slopeLen }, gc, materials.railGlass, true);
     glass.rotation.y = angle;
     glass.rotation.x = -pitch;
     const hc = localPoint(x, z, angle, side * 1.22, halfFwd, rise / 2 + 1.18);
@@ -1393,19 +1452,22 @@ function addEscalator(root, x, z, rise = levelHeight, angle = 0) {
 }
 
 function addTableSet(root, x, z, rotation = 0) {
-  const table = createCylinder("foodTable", { diameter: 1.1, height: 0.12, tessellation: 22 }, new BABYLON.Vector3(x, 0.75, z), materials.table, false);
-  const tableEdge = createCylinder("foodTableEdge", { diameter: 1.16, height: 0.045, tessellation: 22 }, new BABYLON.Vector3(x, 0.82, z), materials.chrome, false);
-  const stem = createCylinder("tableStem", { diameter: 0.16, height: 0.7, tessellation: 10 }, new BABYLON.Vector3(x, 0.38, z), materials.chrome, false);
-  const foot = createCylinder("tableFoot", { diameter: 0.72, height: 0.06, tessellation: 14 }, new BABYLON.Vector3(x, 0.05, z), materials.chrome, false);
+  const table = createCylinder("foodTable", { diameter: 1.1, height: 0.12 }, new BABYLON.Vector3(x, 0.75, z), materials.table, false);
+  const tableEdge = createCylinder("foodTableEdge", { diameter: 1.16, height: 0.045 }, new BABYLON.Vector3(x, 0.82, z), materials.chrome, false);
+  const stem = createCylinder("tableStem", { diameter: 0.16, height: 0.7 }, new BABYLON.Vector3(x, 0.38, z), materials.chrome, false);
+  const foot = createCylinder("tableFoot", { diameter: 0.72, height: 0.06 }, new BABYLON.Vector3(x, 0.05, z), materials.chrome, false);
   root.push(table, tableEdge, stem, foot);
   for (let i = 0; i < 4; i++) {
-    const a = rotation + (Math.PI * i) / 2;
-    const chair = createBox("foodChair", { width: 0.58, height: 0.16, depth: 0.55 }, new BABYLON.Vector3(x + Math.cos(a) * 1.15, 0.45, z + Math.sin(a) * 1.15), materials.seat, false);
-    const chairBack = createBox("foodChairBack", { width: 0.55, height: 0.62, depth: 0.12 }, new BABYLON.Vector3(x + Math.cos(a) * 1.34, 0.72, z + Math.sin(a) * 1.34), materials.seat, false);
-    const chairLeg = createCylinder("foodChairPedestal", { diameter: 0.1, height: 0.42, tessellation: 8 }, new BABYLON.Vector3(x + Math.cos(a) * 1.15, 0.22, z + Math.sin(a) * 1.15), materials.chrome, false);
-    chair.rotation.y = -a;
-    chairBack.rotation.y = -a;
-    root.push(chair, chairBack, chairLeg);
+    // f points from the table out to this chair; everything for the chair is
+    // built along that one ray so seat, pedestal and back stay aligned.
+    const f = rotation + (Math.PI * i) / 2;
+    const seat = createBox("foodChair", { width: 0.52, height: 0.12, depth: 0.52 }, localPoint(x, z, f, 0, 1.0, 0.46), materials.seat, false);
+    const back = createBox("foodChairBack", { width: 0.52, height: 0.6, depth: 0.09 }, localPoint(x, z, f, 0, 1.235, 0.76), materials.seat, false);
+    const leg = createCylinder("foodChairPedestal", { diameter: 0.1, height: 0.42 }, localPoint(x, z, f, 0, 1.0, 0.22), materials.chrome, false);
+    const legFoot = createCylinder("foodChairFoot", { diameter: 0.34, height: 0.05 }, localPoint(x, z, f, 0, 1.0, 0.03), materials.chrome, false);
+    seat.rotation.y = f;
+    back.rotation.y = f;
+    root.push(seat, back, leg, legFoot);
   }
 }
 
@@ -1549,9 +1611,11 @@ function buildAtrium(root, tileX, tileZ, district, rand) {
   if (isCenter) {
     // The galleria void runs through this tile on every level; rail it off and
     // drop in the escalators that actually carry the player up a floor.
-    addVoidRails(root, x, z, hole);
-    addEscalator(root, x - 6.5, z - 8.2, levelHeight, -Math.PI / 2); // ascends heading +X over the -Z walkway
-    if (rand > 0.4) addEscalator(root, x + 6.5, z + 8.2, levelHeight, Math.PI / 2); // ascends heading -X over the +Z walkway
+    addVoidRails(root, x, z, hole, 3.0);
+    // Bridge the open void: board at the -Z edge, ride up across the opening,
+    // step off on the +Z walkway one floor higher. Because the span is over the
+    // hole, the escalator never has to punch through a solid floor.
+    addEscalator(root, x, z - 5.6, levelHeight, 0);
     addUndersideLight(root, x, z - hole / 2 - 0.2, 0.9, true);
     addUndersideLight(root, x, z + hole / 2 + 0.2, 0.9, true);
     if (rand > 0.5) addDirectory(root, x + hole / 2 + 1.6, z - hole / 2 - 1.6, Math.PI / 5);
@@ -1848,6 +1912,7 @@ engine.runRenderLoop(() => {
   const delta = engine.getDeltaTime() / 1000;
   state.time += delta;
   updateMall();
+  if (floorProbe) floorProbe.position.copyFrom(camera.position);
   updateFocus();
   flashlight.intensity = 0.7 + (state.battery / 100) * 1.7;
   if (Math.floor(state.time * 4) % 2 === 0) flashlight.intensity *= 0.82;
