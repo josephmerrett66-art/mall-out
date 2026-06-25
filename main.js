@@ -1,18 +1,99 @@
+// ---------------------------------------------------------------------------
+// VISUAL QUALITY CONFIG
+// Flip these if you need to trade fidelity for frame-rate on weaker hardware.
+// ---------------------------------------------------------------------------
+const QUALITY = {
+  shadows: true, // real cascaded shadows that ground props to the floor
+  shadowMapSize: 1024, // 2048 = crisper shadows, 512 = faster
+  ssao: false, // screen-space ambient occlusion. Off by default (heavier +
+  //              can conflict with post on some GPUs). Try turning it on.
+  dust: true, // floating dust motes that catch the light
+  lightShafts: true, // soft volumetric shafts under the skylights
+  msaaSamples: 4, // 1 disables MSAA
+};
+
 const canvas = document.querySelector("#game");
-const engine = new BABYLON.Engine(canvas, true, { antialias: true });
+const engine = new BABYLON.Engine(canvas, true, {
+  antialias: true,
+  stencil: true,
+  preserveDrawingBuffer: true,
+});
 const scene = new BABYLON.Scene(engine);
-scene.clearColor = new BABYLON.Color4(0.035, 0.037, 0.041, 1);
+scene.clearColor = new BABYLON.Color4(0.03, 0.034, 0.04, 1);
 scene.collisionsEnabled = true;
 scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
-scene.fogColor = new BABYLON.Color3(0.055, 0.054, 0.052);
-scene.fogDensity = 0.0042;
-scene.imageProcessingConfiguration.contrast = 1.05;
-scene.imageProcessingConfiguration.exposure = 1.26;
+// Cooler, slightly lifted haze reads as atmospheric distance rather than a black void.
+scene.fogColor = new BABYLON.Color3(0.052, 0.058, 0.069);
+scene.fogDensity = 0.0036;
+
+// ACES filmic tone mapping is the difference between "3D render" and "photograph".
+// It tames blown-out lights and gives the whole scene a believable response curve.
+const ip = scene.imageProcessingConfiguration;
+ip.toneMappingEnabled = true;
+ip.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
+ip.contrast = 1.15;
+ip.exposure = 1.05;
+// Grade once, in the post pass. Without this the tone map is baked into every
+// material AND re-applied by the pipeline, double-crushing highlights.
+ip.applyByPostProcess = true;
+
+// --- Image-based lighting -------------------------------------------------
+// A procedural interior environment cube: cool light from above (skylights),
+// darker toward the floor, a faint warm bounce from the shopfronts. This is
+// what finally gives the chrome, brass, glass and polished floor something
+// real to reflect instead of flat grey.
+function buildInteriorEnvironment(size = 64) {
+  const faces = [];
+  const top = [206, 222, 236];
+  const bottomCol = [34, 33, 32];
+  const sideTop = [150, 156, 164];
+  const sideBottom = [46, 43, 41];
+  const warm = [26, 14, 4]; // additive warm bounce low on the walls
+  for (let f = 0; f < 6; f++) {
+    const data = new Uint8Array(size * size * 4);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        let r, g, b;
+        if (f === 2) {
+          [r, g, b] = top; // +Y ceiling / skylight
+        } else if (f === 3) {
+          [r, g, b] = bottomCol; // -Y floor
+        } else {
+          const t = y / (size - 1); // 0 top -> 1 bottom
+          const wt = Math.pow(t, 1.6);
+          r = sideTop[0] * (1 - t) + sideBottom[0] * t + warm[0] * wt;
+          g = sideTop[1] * (1 - t) + sideBottom[1] * t + warm[1] * wt;
+          b = sideTop[2] * (1 - t) + sideBottom[2] * t + warm[2] * wt;
+        }
+        data[i] = Math.min(255, r);
+        data[i + 1] = Math.min(255, g);
+        data[i + 2] = Math.min(255, b);
+        data[i + 3] = 255;
+      }
+    }
+    faces.push(data);
+  }
+  const tex = new BABYLON.RawCubeTexture(
+    scene,
+    faces,
+    size,
+    BABYLON.Engine.TEXTUREFORMAT_RGBA,
+    BABYLON.Engine.TEXTURETYPE_UNSIGNED_BYTE,
+    true,
+    false,
+    BABYLON.Texture.TRILINEAR_SAMPLINGMODE,
+  );
+  tex.gammaSpace = false;
+  return tex;
+}
+scene.environmentTexture = buildInteriorEnvironment();
+scene.environmentIntensity = 0.7;
 
 const glow = new BABYLON.GlowLayer("mallGlow", scene, {
-  blurKernelSize: 28,
+  blurKernelSize: 32,
 });
-glow.intensity = 0.3;
+glow.intensity = 0.42;
 
 const ui = {
   start: document.querySelector("#start"),
@@ -56,6 +137,9 @@ function makeTexture(name, size, painter) {
   texture.update();
   texture.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
   texture.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+  // Crisp surfaces at oblique angles — the marble floor stretching to the
+  // horizon is the most-viewed grazing surface in the whole scene.
+  texture.anisotropicFilteringLevel = 8;
   return texture;
 }
 
@@ -90,7 +174,13 @@ function addSharedSurfaceTextures() {
     }
   });
   materials.marble.albedoTexture = marbleTexture;
-  materials.marble.roughness = 0.28;
+  materials.marble.roughness = 0.16;
+  // Polished-floor clearcoat: a thin glossy layer that mirrors the ceiling
+  // lights and shopfront glow into the floor — the signature "wet" mall look.
+  materials.marble.clearCoat.isEnabled = true;
+  materials.marble.clearCoat.intensity = 0.85;
+  materials.marble.clearCoat.roughness = 0.08;
+  materials.marble.environmentIntensity = 1.0;
 
   const ceilingTexture = makeTexture("sharedCeilingTexture", 256, (ctx, size) => {
     ctx.fillStyle = "#333532";
@@ -200,7 +290,7 @@ material("shopGlass", new BABYLON.Color3(0.42, 0.64, 0.68), 0.035, 0.05);
 materials.shopGlass.alpha = 0.27;
 material("railGlass", new BABYLON.Color3(0.62, 0.82, 0.84), 0.025, 0.02);
 materials.railGlass.alpha = 0.32;
-material("chrome", new BABYLON.Color3(0.78, 0.76, 0.68), 0.16, 0.85);
+material("chrome", new BABYLON.Color3(0.82, 0.81, 0.76), 0.12, 0.92);
 material("skylight", new BABYLON.Color3(0.72, 0.9, 1), 0.08);
 materials.skylight.alpha = 0.24;
 material("upperWalkway", new BABYLON.Color3(0.78, 0.76, 0.7));
@@ -252,6 +342,12 @@ material("water", new BABYLON.Color3(0.18, 0.42, 0.48), 0.05, 0.15);
 materials.water.alpha = 0.55;
 materials.water.emissiveColor = new BABYLON.Color3(0.02, 0.06, 0.07);
 material("stoneEdge", new BABYLON.Color3(0.5, 0.47, 0.41), 0.36);
+material("lightShaft", new BABYLON.Color3(1, 0.96, 0.86), 1);
+materials.lightShaft.emissiveColor = new BABYLON.Color3(1, 0.95, 0.84);
+materials.lightShaft.unlit = true;
+materials.lightShaft.alpha = 0.06;
+materials.lightShaft.alphaMode = BABYLON.Engine.ALPHA_ADD;
+materials.lightShaft.backFaceCulling = false;
 material("serviceDoor", new BABYLON.Color3(0.18, 0.2, 0.2), 0.55, 0.05);
 material("warningYellow", new BABYLON.Color3(0.95, 0.72, 0.16), 0.5);
 material("rubber", new BABYLON.Color3(0.035, 0.038, 0.04), 0.78);
@@ -266,7 +362,55 @@ material("camp", new BABYLON.Color3(1, 0.35, 0.12));
 
 addSharedSurfaceTextures();
 
-const camera = new BABYLON.UniversalCamera("player", new BABYLON.Vector3(0, 2.1, -4), scene);
+// --- Physical material refinement ----------------------------------------
+// No new geometry — just a truer PBR response from the surfaces already here.
+function refineMaterialRealism() {
+  // Real metals: full metallic with a little micro-roughness. A flawless
+  // mirror reads as fake CG; cast/brushed metal has texture in its highlight.
+  materials.chrome.metallic = 1.0;
+  materials.chrome.roughness = 0.16;
+  materials.brass.metallic = 1.0;
+  materials.brass.roughness = 0.34;
+  materials.scrap.metallic = 0.62;
+  materials.scrap.roughness = 0.5;
+  materials.shutter.metallic = 0.7;
+  materials.shutter.roughness = 0.44;
+
+  // Specular anti-aliasing kills the crawling shimmer/fireflies on glossy and
+  // metallic edges as the camera moves — one of the strongest "this is real"
+  // cues you get for free.
+  for (const n of ["chrome", "brass", "scrap", "shutter", "marble", "tileAlt", "stoneEdge", "water", "shopGlass", "railGlass", "directory", "blackTrim", "mannequin"]) {
+    if (materials[n]) materials[n].enableSpecularAntiAliasing = true;
+  }
+
+  // Glass that actually behaves like glass: mirrors the environment, refracts
+  // at a believable IOR, and stays visible from both sides.
+  for (const n of ["shopGlass", "railGlass"]) {
+    const g = materials[n];
+    g.environmentIntensity = 1.0;
+    g.indexOfRefraction = 1.5;
+    g.backFaceCulling = false;
+  }
+  materials.water.environmentIntensity = 1.0;
+
+  // Light fixtures should read as the source of the light, not just bright
+  // paint — give them real emission so the glow layer/bloom catch them.
+  materials.light.emissiveColor = new BABYLON.Color3(0.95, 0.74, 0.4);
+  materials.neon.emissiveColor = new BABYLON.Color3(0.1, 0.27, 0.62);
+  materials.redNeon.emissiveColor = new BABYLON.Color3(0.55, 0.08, 0.07);
+  materials.exitGreen.emissiveColor = new BABYLON.Color3(0.05, 0.4, 0.15);
+
+  // Upholstery sheen: the soft retro-reflective bloom fabric gets at grazing
+  // angles. It's the cue that separates "cushion" from "painted block".
+  const cloth = materials.seat;
+  cloth.sheen.isEnabled = true;
+  cloth.sheen.intensity = 0.4;
+  cloth.sheen.roughness = 0.6;
+  cloth.sheen.color = new BABYLON.Color3(0.5, 0.55, 0.7);
+}
+refineMaterialRealism();
+
+const camera = new BABYLON.UniversalCamera("player", new BABYLON.Vector3(0, 2.1, -8.6), scene);
 camera.attachControl(canvas, true);
 camera.minZ = 0.08;
 camera.speed = 0.16;
@@ -281,14 +425,51 @@ camera.keysRight.push(68);
 
 scene.gravity = new BABYLON.Vector3(0, -0.04, 0);
 
+// Lower, cooler ambient. With IBL now carrying the soft fill, we don't need a
+// strong flat hemispheric anymore — pulling it down restores depth and contrast.
 const hemi = new BABYLON.HemisphericLight("ambient", new BABYLON.Vector3(0.2, 1, 0.1), scene);
-hemi.intensity = 0.58;
-hemi.diffuse = new BABYLON.Color3(0.55, 0.58, 0.62);
-hemi.groundColor = new BABYLON.Color3(0.16, 0.14, 0.12);
+hemi.intensity = 0.34;
+hemi.diffuse = new BABYLON.Color3(0.5, 0.55, 0.64);
+hemi.groundColor = new BABYLON.Color3(0.14, 0.12, 0.11);
+hemi.specular = new BABYLON.Color3(0, 0, 0);
 
-const skylightWash = new BABYLON.DirectionalLight("skylightWash", new BABYLON.Vector3(-0.15, -1, 0.2), scene);
-skylightWash.intensity = 0.42;
-skylightWash.diffuse = new BABYLON.Color3(0.82, 0.92, 1);
+// The "sun" — cool daylight raking down through the skylights. This is now the
+// key light AND the shadow caster, so columns, planters and rails throw long
+// soft shadows across the floor.
+const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.32, -1, 0.22), scene);
+sun.position = new BABYLON.Vector3(40, 60, -30);
+sun.intensity = 1.05;
+sun.diffuse = new BABYLON.Color3(1, 0.97, 0.9);
+sun.specular = new BABYLON.Color3(0.9, 0.92, 1);
+
+let shadowGen = null;
+if (QUALITY.shadows && BABYLON.CascadedShadowGenerator) {
+  shadowGen = new BABYLON.CascadedShadowGenerator(QUALITY.shadowMapSize, sun);
+  shadowGen.numCascades = 3;
+  shadowGen.lambda = 0.86;
+  shadowGen.stabilizeCascades = true;
+  shadowGen.autoCalcDepthBounds = true;
+  shadowGen.shadowMaxZ = 78;
+  shadowGen.depthClamp = true;
+  shadowGen.forceBackFacesOnly = true;
+  shadowGen.usePercentageCloserFiltering = true;
+  shadowGen.filteringQuality = BABYLON.ShadowGenerator.QUALITY_MEDIUM;
+  shadowGen.bias = 0.012;
+  shadowGen.normalBias = 0.025;
+  shadowGen.setDarkness(0.42);
+}
+
+// Names of "hero" structural props worth the cost of casting real shadows, and
+// the flat surfaces that should receive them.
+const SHADOW_CASTERS = new Set([
+  "chromeColumn", "planterBox", "kiosk", "foodCounter", "counterFace", "escalator",
+  "palmTrunk", "mannequinBody", "benchSeatSlat", "vendingMachine", "directoryBoard",
+  "productShelf", "adColumn", "trashBin", "softSeat", "foodTable", "poolBase",
+  "anchorPortal", "elevatorWall", "foodCourtBulkhead", "atm", "shopBackWall",
+]);
+const SHADOW_RECEIVERS = new Set([
+  "floor", "shopFloor", "upperWalkway", "escalatorLanding", "poolBase", "foodCounter",
+]);
 
 const flashlight = new BABYLON.SpotLight(
   "flashlight",
@@ -298,16 +479,104 @@ const flashlight = new BABYLON.SpotLight(
   4,
   scene,
 );
-flashlight.intensity = 1.8;
+flashlight.intensity = 1.55;
 flashlight.diffuse = new BABYLON.Color3(1, 0.93, 0.72);
+flashlight.specular = new BABYLON.Color3(1, 0.95, 0.8);
 flashlight.parent = camera;
+
+// --- Post-processing ------------------------------------------------------
+// One pipeline pass that does the heavy lifting on "feel": filmic grade,
+// gentle bloom on the lights/neon, edge anti-aliasing, a faint vignette and a
+// whisper of grain so the image stops looking clinically digital.
+const pipeline = new BABYLON.DefaultRenderingPipeline("postFx", true, scene, [camera]);
+pipeline.samples = QUALITY.msaaSamples;
+pipeline.fxaaEnabled = true;
+
+pipeline.bloomEnabled = true;
+pipeline.bloomThreshold = 0.82;
+pipeline.bloomWeight = 0.45;
+pipeline.bloomKernel = 64;
+pipeline.bloomScale = 0.6;
+
+pipeline.imageProcessing.toneMappingEnabled = true;
+pipeline.imageProcessing.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
+pipeline.imageProcessing.contrast = 1.15;
+pipeline.imageProcessing.exposure = 1.05;
+pipeline.imageProcessing.vignetteEnabled = true;
+pipeline.imageProcessing.vignetteWeight = 2.4;
+pipeline.imageProcessing.vignetteColor = new BABYLON.Color4(0, 0, 0, 0);
+pipeline.imageProcessing.vignetteCameraFov = 1.0;
+
+pipeline.grainEnabled = true;
+pipeline.grain.intensity = 6;
+pipeline.grain.animated = true;
+
+pipeline.sharpenEnabled = true;
+pipeline.sharpen.edgeAmount = 0.18;
+pipeline.sharpen.colorAmount = 1.0;
+
+if (QUALITY.ssao && BABYLON.SSAO2RenderingPipeline && BABYLON.SSAO2RenderingPipeline.IsSupported) {
+  const ssao = new BABYLON.SSAO2RenderingPipeline("ssao", scene, { ssaoRatio: 0.6, blurRatio: 1 }, [camera]);
+  ssao.radius = 1.4;
+  ssao.totalStrength = 1.1;
+  ssao.base = 0.1;
+  ssao.expensiveBlur = true;
+  ssao.samples = 16;
+  ssao.maxZ = 60;
+}
+
+// --- Atmosphere: floating dust -------------------------------------------
+// Slow motes drifting through the air, lit by the bloom/light shafts. Cheap,
+// but it does an enormous amount of work selling "real, still, abandoned space".
+let dust = null;
+if (QUALITY.dust) {
+  const dustTex = new BABYLON.DynamicTexture("dustTex", { width: 32, height: 32 }, scene);
+  const dctx = dustTex.getContext();
+  const grd = dctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grd.addColorStop(0, "rgba(255,250,235,1)");
+  grd.addColorStop(1, "rgba(255,250,235,0)");
+  dctx.fillStyle = grd;
+  dctx.fillRect(0, 0, 32, 32);
+  dustTex.update();
+  dustTex.hasAlpha = true;
+
+  dust = new BABYLON.ParticleSystem("dust", 340, scene);
+  dust.particleTexture = dustTex;
+  dust.emitter = camera.position;
+  dust.minEmitBox = new BABYLON.Vector3(-18, -4, -18);
+  dust.maxEmitBox = new BABYLON.Vector3(18, 7, 18);
+  dust.color1 = new BABYLON.Color4(1, 0.96, 0.86, 0.16);
+  dust.color2 = new BABYLON.Color4(0.85, 0.9, 1, 0.1);
+  dust.colorDead = new BABYLON.Color4(1, 1, 1, 0);
+  dust.minSize = 0.015;
+  dust.maxSize = 0.05;
+  dust.minLifeTime = 9;
+  dust.maxLifeTime = 17;
+  dust.emitRate = 45;
+  dust.blendMode = BABYLON.ParticleSystem.BLENDMODE_ADD;
+  dust.gravity = new BABYLON.Vector3(0, 0.004, 0);
+  dust.direction1 = new BABYLON.Vector3(-0.05, 0.01, -0.05);
+  dust.direction2 = new BABYLON.Vector3(0.05, 0.05, 0.05);
+  dust.minEmitPower = 0.02;
+  dust.maxEmitPower = 0.08;
+  dust.updateSpeed = 0.02;
+  dust.start();
+}
+
 
 const mall = new Map();
 const interactables = new Set();
 const placed = [];
 const tileSize = 22;
-const renderRadius = 3;
+const renderRadius = 2; // horizontal tiles each way (smaller now that we also stream vertically)
 const districtSize = 5;
+// --- Vertical streaming ---------------------------------------------------
+// The mall now stacks endlessly upward and downward. Each tile is generated
+// per floor and offset by levelHeight; floors stream in/out by camera height
+// exactly the way tiles stream by camera position.
+const levelHeight = 6.5;
+const vRadiusUp = 2; // floors rendered above the player's current floor
+const vRadiusDown = 1; // floors rendered below
 
 function seeded(x, z) {
   let n = x * 374761393 + z * 668265263;
@@ -323,7 +592,16 @@ function createBox(name, size, position, mat, collides = true) {
   return mesh;
 }
 
+// Roundness that scales with size: a thin cord needs few sides, a chrome
+// column needs many. This quietly de-facets every round prop in the world
+// without touching a single call site.
+function roundSides(diameter, min, max) {
+  return Math.max(min, Math.min(max, Math.round(diameter * 18) + 12));
+}
+
 function createCylinder(name, options, position, mat, collides = true) {
+  const d = Math.max(options.diameter || 0, options.diameterTop || 0, options.diameterBottom || 0);
+  if (d > 0) options.tessellation = Math.max(options.tessellation || 0, roundSides(d, 16, 48));
   const mesh = BABYLON.MeshBuilder.CreateCylinder(name, options, scene);
   mesh.position.copyFrom(position);
   mesh.material = mat;
@@ -332,7 +610,17 @@ function createCylinder(name, options, position, mat, collides = true) {
 }
 
 function createSphere(name, options, position, mat, collides = false) {
+  if (options.diameter) options.segments = Math.max(options.segments || 0, roundSides(options.diameter, 16, 36));
   const mesh = BABYLON.MeshBuilder.CreateSphere(name, options, scene);
+  mesh.position.copyFrom(position);
+  mesh.material = mat;
+  mesh.checkCollisions = collides;
+  return mesh;
+}
+
+function createCapsule(name, options, position, mat, collides = false) {
+  options.tessellation = options.tessellation || roundSides((options.radius || 0.4) * 2, 16, 32);
+  const mesh = BABYLON.MeshBuilder.CreateCapsule(name, options, scene);
   mesh.position.copyFrom(position);
   mesh.material = mat;
   mesh.checkCollisions = collides;
@@ -461,7 +749,7 @@ function addBench(root, x, z, rotation = 0) {
 }
 
 function addDirectory(root, x, z, rotation = 0) {
-  const post = createBox("directoryPost", { width: 0.18, height: 1.2, depth: 0.18 }, new BABYLON.Vector3(x, 0.6, z), materials.chrome, false);
+  const post = createCylinder("directoryPost", { diameter: 0.2, height: 1.2 }, new BABYLON.Vector3(x, 0.6, z), materials.chrome, false);
   const board = createBox("directoryBoard", { width: 1.85, height: 2.35, depth: 0.16 }, new BABYLON.Vector3(x, 1.85, z), materials.directory, false);
   const cap = createBox("directoryCap", { width: 2.0, height: 0.12, depth: 0.26 }, new BABYLON.Vector3(x, 3.06, z), materials.chrome, false);
   const foot = createCylinder("directoryFoot", { diameter: 0.72, height: 0.08, tessellation: 14 }, new BABYLON.Vector3(x, 0.05, z), materials.chrome, false);
@@ -469,16 +757,16 @@ function addDirectory(root, x, z, rotation = 0) {
   board.rotation.y = rotation;
   cap.rotation.y = rotation;
   root.push(post, board, cap, foot);
-  addPanelText(root, "YOU ARE\nHERE", new BABYLON.Vector3(x, 1.94, z - 0.095), rotation, 1.55, 1.65, "#182126", "#9dd9ff");
+  addPanelText(root, "YOU ARE\nHERE", localPoint(x, z, rotation, 0, -0.095, 1.94), rotation, 1.55, 1.65, "#182126", "#9dd9ff");
 }
 
 function addHangingWayfinder(root, x, z, rotation = 0, text = "FOOD COURT") {
-  root.push(createCylinder("signCord", { diameter: 0.035, height: 1.2, tessellation: 6 }, new BABYLON.Vector3(x - 1.25, 4.15, z), materials.blackTrim, false));
-  root.push(createCylinder("signCord", { diameter: 0.035, height: 1.2, tessellation: 6 }, new BABYLON.Vector3(x + 1.25, 4.15, z), materials.blackTrim, false));
+  root.push(createCylinder("signCord", { diameter: 0.035, height: 1.2, tessellation: 6 }, localPoint(x, z, rotation, -1.25, 0, 4.15), materials.blackTrim, false));
+  root.push(createCylinder("signCord", { diameter: 0.035, height: 1.2, tessellation: 6 }, localPoint(x, z, rotation, 1.25, 0, 4.15), materials.blackTrim, false));
   const board = createBox("wayfinderBoard", { width: 3.4, height: 0.85, depth: 0.12 }, new BABYLON.Vector3(x, 3.45, z), materials.directory, false);
   board.rotation.y = rotation;
   root.push(board);
-  addPanelText(root, text, new BABYLON.Vector3(x, 3.46, z - 0.07), rotation, 3, 0.62, "#101820", "#f2e6c8");
+  addPanelText(root, text, localPoint(x, z, rotation, 0, -0.07, 3.46), rotation, 3, 0.62, "#101820", "#f2e6c8");
 }
 
 function addAdBanner(root, x, z, rotation = 0, text = "MID SEASON") {
@@ -486,7 +774,7 @@ function addAdBanner(root, x, z, rotation = 0, text = "MID SEASON") {
   const banner = createBox("adBanner", { width: 2.4, height: 3.1, depth: 0.08 }, new BABYLON.Vector3(x, 4.05, z), materials.posterRed, false);
   banner.rotation.y = rotation;
   root.push(banner);
-  addPanelText(root, text, new BABYLON.Vector3(x, 4.05, z - 0.055), rotation, 2.1, 1.2, "#a51e1e", "#fff5d8");
+  addPanelText(root, text, localPoint(x, z, rotation, 0, -0.055, 4.05), rotation, 2.1, 1.2, "#a51e1e", "#fff5d8");
 }
 
 function addAdvertisingColumn(root, x, z) {
@@ -498,13 +786,13 @@ function addAdvertisingColumn(root, x, z) {
 
 function addServiceDoor(root, x, z, rotation = 0) {
   const door = createBox("serviceDoor", { width: 1.45, height: 2.35, depth: 0.12 }, new BABYLON.Vector3(x, 1.25, z), materials.serviceDoor, false);
-  const frame = createBox("serviceDoorFrame", { width: 1.68, height: 2.58, depth: 0.08 }, new BABYLON.Vector3(x, 1.32, z + 0.02), materials.blackTrim, false);
-  const kick = createBox("serviceDoorKick", { width: 1.15, height: 0.24, depth: 0.13 }, new BABYLON.Vector3(x, 0.35, z - 0.04), materials.chrome, false);
+  const frame = createBox("serviceDoorFrame", { width: 1.68, height: 2.58, depth: 0.08 }, localPoint(x, z, rotation, 0, 0.02, 1.32), materials.blackTrim, false);
+  const kick = createBox("serviceDoorKick", { width: 1.15, height: 0.24, depth: 0.13 }, localPoint(x, z, rotation, 0, -0.04, 0.35), materials.chrome, false);
   const handle = createBox("serviceDoorHandle", { width: 0.12, height: 0.1, depth: 0.34 }, localPoint(x, z, rotation, 0.48, -0.09, 1.25), materials.chrome, false);
   const vent = createBox("serviceDoorVent", { width: 0.72, height: 0.18, depth: 0.13 }, localPoint(x, z, rotation, 0, -0.09, 0.82), materials.blackTrim, false);
   for (const mesh of [door, frame, kick, handle, vent]) mesh.rotation.y = rotation;
   root.push(frame, door, kick, handle, vent);
-  addPanelText(root, "STAFF", new BABYLON.Vector3(x, 1.95, z - 0.08), rotation, 0.9, 0.32, "#111", "#f0d06a");
+  addPanelText(root, "STAFF", localPoint(x, z, rotation, 0, -0.08, 1.95), rotation, 0.9, 0.32, "#111", "#f0d06a");
 }
 
 function addPartialShutter(root, x, z, direction) {
@@ -681,16 +969,16 @@ function addUpperShopGlow(root, x, z, rotation = 0, text = "OPEN") {
   const panel = createBox("upperShopGlow", { width: 3.6, height: 1.05, depth: 0.1 }, new BABYLON.Vector3(x, 6.15, z), mat, false);
   panel.rotation.y = rotation;
   root.push(panel);
-  addPanelText(root, text, new BABYLON.Vector3(x, 6.16, z - 0.07), rotation, 2.6, 0.5, "#14191d", "#ffe8b0");
+  addPanelText(root, text, localPoint(x, z, rotation, 0, -0.07, 6.16), rotation, 2.6, 0.5, "#14191d", "#ffe8b0");
 }
 
 function addAnchorStorePortal(root, x, z, rotation = 0, text = "DEPARTMENT STORE") {
   const frame = createBox("anchorPortal", { width: 5.8, height: 3.8, depth: 0.28 }, new BABYLON.Vector3(x, 2.1, z), materials.blackTrim, false);
-  const glowPanel = createBox("anchorGlow", { width: 4.9, height: 2.7, depth: 0.08 }, new BABYLON.Vector3(x, 1.85, z - 0.12), materials.storeWarm, false);
+  const glowPanel = createBox("anchorGlow", { width: 4.9, height: 2.7, depth: 0.08 }, localPoint(x, z, rotation, 0, -0.12, 1.85), materials.storeWarm, false);
   frame.rotation.y = rotation;
   glowPanel.rotation.y = rotation;
   root.push(frame, glowPanel);
-  addPanelText(root, text, new BABYLON.Vector3(x, 3.55, z - 0.16), rotation, 4.9, 0.7, "#1b1d1f", "#f5dfaa");
+  addPanelText(root, text, localPoint(x, z, rotation, 0, -0.16, 3.55), rotation, 4.9, 0.7, "#1b1d1f", "#f5dfaa");
 }
 
 function addFoodCourtBulkhead(root, x, z, text = "FRESH FOOD") {
@@ -734,13 +1022,37 @@ function addSunPatch(root, x, z, width, depth, rotation = 0) {
   root.push(patch);
 }
 
+function addLightShaft(root, x, z) {
+  if (!QUALITY.lightShafts) return;
+  // A few tall, near-transparent additive blades angled like the sun coming
+  // through the glazing. Stacked at slightly different angles they read as a
+  // soft column of light rather than flat cards.
+  const angles = [0.16, -0.1, 0.04];
+  for (let i = 0; i < angles.length; i++) {
+    const blade = BABYLON.MeshBuilder.CreatePlane(
+      "lightShaft",
+      { width: 5.4 + i * 1.6, height: 12.6 },
+      scene,
+    );
+    blade.position = new BABYLON.Vector3(x - 1.4 + i * 1.0, 6.1, z + 0.6 - i * 0.8);
+    blade.rotation.x = angles[i];
+    blade.rotation.y = 0.5 + i * 0.35;
+    blade.rotation.z = 0.26;
+    blade.material = materials.lightShaft;
+    blade.isPickable = false;
+    blade.checkCollisions = false;
+    blade.applyFog = false;
+    root.push(blade);
+  }
+}
+
 function addReflectingPool(root, x, z, rotation = 0) {
   const base = createBox("poolBase", { width: 8.4, height: 0.16, depth: 3.6 }, new BABYLON.Vector3(x, 0.08, z), materials.stoneEdge, false);
   const water = createBox("poolWater", { width: 7.4, height: 0.035, depth: 2.65 }, new BABYLON.Vector3(x, 0.2, z), materials.water, false);
-  const edgeA = createBox("poolEdge", { width: 8.5, height: 0.22, depth: 0.18 }, new BABYLON.Vector3(x, 0.25, z - 1.86), materials.stoneEdge, false);
-  const edgeB = createBox("poolEdge", { width: 8.5, height: 0.22, depth: 0.18 }, new BABYLON.Vector3(x, 0.25, z + 1.86), materials.stoneEdge, false);
-  const edgeC = createBox("poolEdge", { width: 0.18, height: 0.22, depth: 3.5 }, new BABYLON.Vector3(x - 4.25, 0.25, z), materials.stoneEdge, false);
-  const edgeD = createBox("poolEdge", { width: 0.18, height: 0.22, depth: 3.5 }, new BABYLON.Vector3(x + 4.25, 0.25, z), materials.stoneEdge, false);
+  const edgeA = createBox("poolEdge", { width: 8.5, height: 0.22, depth: 0.18 }, localPoint(x, z, rotation, 0, -1.86, 0.25), materials.stoneEdge, false);
+  const edgeB = createBox("poolEdge", { width: 8.5, height: 0.22, depth: 0.18 }, localPoint(x, z, rotation, 0, 1.86, 0.25), materials.stoneEdge, false);
+  const edgeC = createBox("poolEdge", { width: 0.18, height: 0.22, depth: 3.5 }, localPoint(x, z, rotation, -4.25, 0, 0.25), materials.stoneEdge, false);
+  const edgeD = createBox("poolEdge", { width: 0.18, height: 0.22, depth: 3.5 }, localPoint(x, z, rotation, 4.25, 0, 0.25), materials.stoneEdge, false);
   for (const mesh of [base, water, edgeA, edgeB, edgeC, edgeD]) mesh.rotation.y = rotation;
   root.push(base, water, edgeA, edgeB, edgeC, edgeD);
   for (let i = -1; i <= 1; i++) {
@@ -748,19 +1060,22 @@ function addReflectingPool(root, x, z, rotation = 0) {
     glint.rotation.y = rotation + 0.18;
     root.push(glint);
   }
-  addPlanter(root, x - 3.2, z, 0.72);
-  addPlanter(root, x + 3.2, z, 0.72);
+  const pA = localPoint(x, z, rotation, -3.2, 0, 0);
+  const pB = localPoint(x, z, rotation, 3.2, 0, 0);
+  addPlanter(root, pA.x, pA.z, 0.72);
+  addPlanter(root, pB.x, pB.z, 0.72);
 }
 
 function addSoftSeatingIsland(root, x, z, rotation = 0) {
   const rug = createCylinder("seatingRug", { diameter: 4.3, height: 0.025, tessellation: 32 }, new BABYLON.Vector3(x, 0.09, z), materials.shadowMat, false);
-  const seatA = createBox("softSeat", { width: 1.8, height: 0.55, depth: 0.9 }, new BABYLON.Vector3(x - 0.8, 0.36, z), materials.seat, false);
-  const seatB = createBox("softSeat", { width: 1.8, height: 0.55, depth: 0.9 }, new BABYLON.Vector3(x + 0.8, 0.36, z + 1.0), materials.awningGreen, false);
-  const cushionA = createBox("softSeatCushion", { width: 1.7, height: 0.08, depth: 0.82 }, new BABYLON.Vector3(x - 0.8, 0.68, z), materials.posterCream, false);
-  const cushionB = createBox("softSeatCushion", { width: 1.7, height: 0.08, depth: 0.82 }, new BABYLON.Vector3(x + 0.8, 0.68, z + 1.0), materials.posterCream, false);
+  const seatA = createBox("softSeat", { width: 1.8, height: 0.55, depth: 0.9 }, localPoint(x, z, rotation, -0.8, 0, 0.36), materials.seat, false);
+  const seatB = createBox("softSeat", { width: 1.8, height: 0.55, depth: 0.9 }, localPoint(x, z, rotation, 0.8, 1.0, 0.36), materials.awningGreen, false);
+  const cushionA = createBox("softSeatCushion", { width: 1.7, height: 0.08, depth: 0.82 }, localPoint(x, z, rotation, -0.8, 0, 0.68), materials.posterCream, false);
+  const cushionB = createBox("softSeatCushion", { width: 1.7, height: 0.08, depth: 0.82 }, localPoint(x, z, rotation, 0.8, 1.0, 0.68), materials.posterCream, false);
   for (const mesh of [rug, seatA, seatB, cushionA, cushionB]) mesh.rotation.y = rotation;
   root.push(rug, seatA, seatB, cushionA, cushionB);
-  addPlanter(root, x + 1.7, z - 1.2, 0.62);
+  const pp = localPoint(x, z, rotation, 1.7, -1.2, 0);
+  addPlanter(root, pp.x, pp.z, 0.62);
 }
 
 function addStoreLightWall(root, x, z, direction, rand) {
@@ -845,22 +1160,19 @@ function addStorefrontReflections(root, x, z, direction, rand) {
 
 function addEscalatorLanding(root, x, z, angle = 0) {
   const landing = createBox("escalatorLanding", { width: 4.8, height: 0.16, depth: 2.4 }, new BABYLON.Vector3(x, 0.18, z), materials.scrap, false);
-  const comb = createBox("escalatorComb", { width: 4.9, height: 0.06, depth: 0.32 }, new BABYLON.Vector3(x, 0.31, z - 1.05), materials.chrome, false);
-  const plateLineA = createBox("landingPlateLine", { width: 4.4, height: 0.018, depth: 0.035 }, new BABYLON.Vector3(x, 0.285, z - 0.3), materials.blackTrim, false);
-  const plateLineB = createBox("landingPlateLine", { width: 4.4, height: 0.018, depth: 0.035 }, new BABYLON.Vector3(x, 0.286, z + 0.35), materials.blackTrim, false);
-  landing.rotation.y = angle;
-  comb.rotation.y = angle;
-  plateLineA.rotation.y = angle;
-  plateLineB.rotation.y = angle;
+  const comb = createBox("escalatorComb", { width: 4.9, height: 0.06, depth: 0.32 }, localPoint(x, z, angle, 0, -1.05, 0.31), materials.chrome, false);
+  const plateLineA = createBox("landingPlateLine", { width: 4.4, height: 0.018, depth: 0.035 }, localPoint(x, z, angle, 0, -0.3, 0.285), materials.blackTrim, false);
+  const plateLineB = createBox("landingPlateLine", { width: 4.4, height: 0.018, depth: 0.035 }, localPoint(x, z, angle, 0, 0.35, 0.286), materials.blackTrim, false);
+  for (const mesh of [landing, comb, plateLineA, plateLineB]) mesh.rotation.y = angle;
   root.push(landing, comb, plateLineA, plateLineB);
 }
 
 function addMannequin(root, x, z, rotation = 0) {
-  const body = createCylinder("mannequinBody", { diameterTop: 0.38, diameterBottom: 0.58, height: 1.18, tessellation: 14 }, new BABYLON.Vector3(x, 1.05, z), materials.mannequin, false);
-  const waist = createCylinder("mannequinWaist", { diameterTop: 0.46, diameterBottom: 0.34, height: 0.36, tessellation: 14 }, new BABYLON.Vector3(x, 0.52, z), materials.mannequin, false);
-  const head = createSphere("mannequinHead", { diameter: 0.34, segments: 14 }, new BABYLON.Vector3(x, 1.86, z), materials.mannequin, false);
-  const neck = createCylinder("mannequinNeck", { diameter: 0.16, height: 0.16, tessellation: 10 }, new BABYLON.Vector3(x, 1.62, z), materials.mannequin, false);
-  const stand = createCylinder("mannequinStand", { diameter: 0.7, height: 0.055, tessellation: 16 }, new BABYLON.Vector3(x, 0.06, z), materials.chrome, false);
+  const body = createCapsule("mannequinBody", { height: 1.22, radius: 0.25 }, new BABYLON.Vector3(x, 1.07, z), materials.mannequin, false);
+  const waist = createCylinder("mannequinWaist", { diameterTop: 0.46, diameterBottom: 0.34, height: 0.36 }, new BABYLON.Vector3(x, 0.52, z), materials.mannequin, false);
+  const head = createSphere("mannequinHead", { diameter: 0.34 }, new BABYLON.Vector3(x, 1.86, z), materials.mannequin, false);
+  const neck = createCylinder("mannequinNeck", { diameter: 0.16, height: 0.16 }, new BABYLON.Vector3(x, 1.62, z), materials.mannequin, false);
+  const stand = createCylinder("mannequinStand", { diameter: 0.7, height: 0.055 }, new BABYLON.Vector3(x, 0.06, z), materials.chrome, false);
   for (const mesh of [body, waist, head, neck, stand]) mesh.rotation.y = rotation;
   root.push(body, waist, head, neck, stand);
 }
@@ -890,11 +1202,11 @@ function addRailPosts(root, x, z, horizontal = true, y = 4.3) {
 }
 
 function addShopperSilhouette(root, x, z, rotation = 0) {
-  const body = createCylinder("shopperBody", { diameterTop: 0.34, diameterBottom: 0.46, height: 1.18, tessellation: 8 }, new BABYLON.Vector3(x, 0.95, z), materials.silhouette, false);
-  const head = createSphere("shopperHead", { diameter: 0.32, segments: 8 }, new BABYLON.Vector3(x, 1.75, z), materials.silhouette, false);
-  const bag = createBox("shoppingBag", { width: 0.32, height: 0.44, depth: 0.18 }, new BABYLON.Vector3(x + 0.35, 0.78, z), materials.posterCream, false);
-  const legA = createBox("shopperLeg", { width: 0.12, height: 0.55, depth: 0.12 }, new BABYLON.Vector3(x - 0.12, 0.32, z), materials.silhouette, false);
-  const legB = createBox("shopperLeg", { width: 0.12, height: 0.55, depth: 0.12 }, new BABYLON.Vector3(x + 0.12, 0.32, z + 0.05), materials.silhouette, false);
+  const body = createCapsule("shopperBody", { height: 1.24, radius: 0.21 }, new BABYLON.Vector3(x, 0.98, z), materials.silhouette, false);
+  const head = createSphere("shopperHead", { diameter: 0.32 }, new BABYLON.Vector3(x, 1.75, z), materials.silhouette, false);
+  const bag = createBox("shoppingBag", { width: 0.32, height: 0.44, depth: 0.18 }, localPoint(x, z, rotation, 0.35, 0, 0.78), materials.posterCream, false);
+  const legA = createCylinder("shopperLeg", { diameter: 0.13, height: 0.6 }, localPoint(x, z, rotation, -0.12, 0, 0.32), materials.silhouette, false);
+  const legB = createCylinder("shopperLeg", { diameter: 0.13, height: 0.6 }, localPoint(x, z, rotation, 0.12, 0.05, 0.32), materials.silhouette, false);
   for (const mesh of [body, head, bag, legA, legB]) mesh.rotation.y = rotation;
   root.push(body, head, bag, legA, legB);
 }
@@ -902,6 +1214,15 @@ function addShopperSilhouette(root, x, z, rotation = 0) {
 function finalizeTile(root) {
   for (const item of root) {
     if (item instanceof BABYLON.Mesh) {
+      if (shadowGen) {
+        if (SHADOW_CASTERS.has(item.name)) {
+          shadowGen.addShadowCaster(item);
+          item._isHeroCaster = true;
+        }
+        if (SHADOW_RECEIVERS.has(item.name)) {
+          item.receiveShadows = true;
+        }
+      }
       item.freezeWorldMatrix();
     }
   }
@@ -934,10 +1255,48 @@ function addFloorPattern(root, x, z, district) {
   if (district.type !== "concourse") addFloorShadow(root, x + 3.6, z - 3.2, 7.2, 2.8, -0.25);
 }
 
-function addCeiling(root, x, z, high = false) {
-  const y = high ? 12.4 : 5.1;
-  const mat = high ? materials.skylight : materials.ceiling;
-  root.push(createBox("ceiling", { width: tileSize, height: 0.26, depth: tileSize }, new BABYLON.Vector3(x, y, z), mat, false));
+// Atrium floor with a central void, so the galleria reads as an open shaft
+// running through every stacked level. The border strips stay walkable.
+function addAtriumVoidFloor(root, x, z, hole = 11) {
+  const border = (tileSize - hole) / 2;
+  const off = hole / 2 + border / 2;
+  const strips = [
+    { w: tileSize, d: border, cx: 0, cz: off },
+    { w: tileSize, d: border, cx: 0, cz: -off },
+    { w: border, d: hole, cx: off, cz: 0 },
+    { w: border, d: hole, cx: -off, cz: 0 },
+  ];
+  for (const s of strips) {
+    root.push(createBox("floor", { width: s.w, height: 0.35, depth: s.d }, new BABYLON.Vector3(x + s.cx, -0.18, z + s.cz), materials.marble));
+  }
+  // thin trim ring around the opening
+  root.push(createBox("floorTrim", { width: hole + 0.5, height: 0.04, depth: 0.22 }, new BABYLON.Vector3(x, 0.04, z - hole / 2), materials.floorTrim, false));
+  root.push(createBox("floorTrim", { width: hole + 0.5, height: 0.04, depth: 0.22 }, new BABYLON.Vector3(x, 0.04, z + hole / 2), materials.floorTrim, false));
+  root.push(createBox("floorTrim", { width: 0.22, height: 0.04, depth: hole + 0.5 }, new BABYLON.Vector3(x - hole / 2, 0.04, z), materials.floorTrim, false));
+  root.push(createBox("floorTrim", { width: 0.22, height: 0.04, depth: hole + 0.5 }, new BABYLON.Vector3(x + hole / 2, 0.04, z), materials.floorTrim, false));
+  addTileGrout(root, x, z);
+}
+
+// Waist-high glass balustrade around the atrium opening.
+function addVoidRails(root, x, z, hole = 11) {
+  const h = hole / 2;
+  const specs = [
+    { w: hole + 0.3, d: 0.1, cx: 0, cz: -h },
+    { w: hole + 0.3, d: 0.1, cx: 0, cz: h },
+    { w: 0.1, d: hole + 0.3, cx: -h, cz: 0 },
+    { w: 0.1, d: hole + 0.3, cx: h, cz: 0 },
+  ];
+  for (const s of specs) {
+    root.push(createBox("glassRail", { width: s.w, height: 0.92, depth: s.d }, new BABYLON.Vector3(x + s.cx, 0.55, z + s.cz), materials.railGlass, true));
+    root.push(createBox("railTopCap", { width: s.w + 0.12, height: 0.08, depth: s.d + 0.06 }, new BABYLON.Vector3(x + s.cx, 1.04, z + s.cz), materials.chrome, false));
+    root.push(createBox("railBottomTrack", { width: s.w + 0.08, height: 0.06, depth: s.d + 0.04 }, new BABYLON.Vector3(x + s.cx, 0.12, z + s.cz), materials.blackTrim, false));
+  }
+}
+
+function addCeiling(root, x, z) {
+  // One ceiling height per level so floors stack without overlapping.
+  const y = 5.4;
+  root.push(createBox("ceiling", { width: tileSize, height: 0.26, depth: tileSize }, new BABYLON.Vector3(x, y, z), materials.ceiling, false));
   addCeilingGrid(root, x, z, y, tileSize, tileSize);
 }
 
@@ -984,26 +1343,53 @@ function addHangingLight(root, x, z, color = new BABYLON.Color3(0.75, 0.92, 1)) 
   root.push(cord, orb, light);
 }
 
-function addEscalator(root, x, z, angle = 0) {
-  const base = createBox("escalator", { width: 1.8, height: 0.3, depth: 8.5 }, new BABYLON.Vector3(x, 2.35, z), materials.scrap, false);
-  const glassL = createBox("escalatorGlass", { width: 0.09, height: 0.72, depth: 8.5 }, new BABYLON.Vector3(x - 1, 2.75, z), materials.railGlass, false);
-  const glassR = createBox("escalatorGlass", { width: 0.09, height: 0.72, depth: 8.5 }, new BABYLON.Vector3(x + 1, 2.75, z), materials.railGlass, false);
-  const handL = createBox("escalatorHandrail", { width: 0.16, height: 0.08, depth: 8.55 }, new BABYLON.Vector3(x - 1.04, 3.15, z), materials.rubber, false);
-  const handR = createBox("escalatorHandrail", { width: 0.16, height: 0.08, depth: 8.55 }, new BABYLON.Vector3(x + 1.04, 3.15, z), materials.rubber, false);
-  const steps = [];
-  for (let i = -4; i <= 4; i++) {
-    steps.push(createBox("escalatorStep", { width: 1.45, height: 0.04, depth: 0.56 }, new BABYLON.Vector3(x, 2.57 + i * 0.055, z + i * 0.83), materials.blackTrim, false));
-    steps.push(createBox("stepRib", { width: 1.35, height: 0.018, depth: 0.035 }, new BABYLON.Vector3(x, 2.61 + i * 0.055, z + i * 0.83 - 0.16), materials.chrome, false));
+// A walkable escalator: a solid inclined ramp the player can climb, rising
+// `rise` units over a ~28-degree slope, heading in world direction `angle`.
+// All sub-parts are placed with localPoint so the whole assembly orients
+// correctly at any heading. Walk up it to reach the level above; walk down to
+// descend.
+function addEscalator(root, x, z, rise = levelHeight, angle = 0) {
+  const run = rise * 1.9;
+  const slopeLen = Math.hypot(run, rise);
+  const pitch = Math.atan2(rise, run);
+  const halfFwd = run / 2;
+
+  const rampCenter = localPoint(x, z, angle, 0, halfFwd, rise / 2);
+  const ramp = createBox("escalator", { width: 2.3, height: 0.38, depth: slopeLen }, rampCenter, materials.scrap, true);
+  ramp.rotation.y = angle;
+  ramp.rotation.x = -pitch; // forward (+local Z) end tilts up
+  ramp.receiveShadows = true;
+  root.push(ramp);
+
+  // small flat landings so you step on/off cleanly
+  const botLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, -0.4, 0.12), materials.scrap, true);
+  const topLanding = createBox("escLanding", { width: 2.3, height: 0.3, depth: 1.0 }, localPoint(x, z, angle, 0, run + 0.4, rise + 0.12), materials.scrap, true);
+  botLanding.rotation.y = angle;
+  topLanding.rotation.y = angle;
+  root.push(botLanding, topLanding);
+
+  // decorative step ribs running up the slope
+  const stepCount = Math.max(8, Math.round(slopeLen / 0.5));
+  for (let i = 1; i < stepCount; i++) {
+    const t = i / stepCount;
+    const p = localPoint(x, z, angle, 0, run * t, rise * t + 0.22);
+    const rib = createBox("stepRib", { width: 2.05, height: 0.03, depth: 0.07 }, p, materials.chrome, false);
+    rib.rotation.y = angle;
+    root.push(rib);
   }
-  for (const mesh of [base, glassL, glassR, handL, handR]) {
-    mesh.rotation.y = angle;
-    mesh.rotation.x = -0.22;
+
+  // glass balustrades + rubber handrails down both sides
+  for (const side of [-1, 1]) {
+    const gc = localPoint(x, z, angle, side * 1.2, halfFwd, rise / 2 + 0.62);
+    const glass = createBox("escalatorGlass", { width: 0.08, height: 1.0, depth: slopeLen }, gc, materials.railGlass, false);
+    glass.rotation.y = angle;
+    glass.rotation.x = -pitch;
+    const hc = localPoint(x, z, angle, side * 1.22, halfFwd, rise / 2 + 1.18);
+    const hand = createBox("escalatorHandrail", { width: 0.13, height: 0.11, depth: slopeLen + 0.3 }, hc, materials.rubber, false);
+    hand.rotation.y = angle;
+    hand.rotation.x = -pitch;
+    root.push(glass, hand);
   }
-  for (const step of steps) {
-    step.rotation.y = angle;
-    step.rotation.x = -0.22;
-  }
-  root.push(base, glassL, glassR, ...steps);
 }
 
 function addTableSet(root, x, z, rotation = 0) {
@@ -1153,85 +1539,71 @@ function buildAtrium(root, tileX, tileZ, district, rand) {
   const z = tileZ * tileSize;
   const edgeX = Math.abs(district.localX) === 2;
   const edgeZ = Math.abs(district.localZ) === 2;
-  addCeiling(root, x, z, true);
-  if (district.localX === 0 || district.localZ === 0) addSunPatch(root, x - 2.4, z + 1.6, 6.8, 3.2, -0.22);
-  for (let i = -2; i <= 2; i++) {
-    root.push(createBox("skylightRib", { width: 0.14, height: 0.18, depth: tileSize }, new BABYLON.Vector3(x + i * 4.4, 12.22, z), materials.chrome, false));
-    root.push(createBox("skylightRib", { width: tileSize, height: 0.18, depth: 0.14 }, new BABYLON.Vector3(x, 12.21, z + i * 4.4), materials.chrome, false));
-  }
-  addDownlightRow(root, x, z - 7.15, 0, 7.04, 7);
-  addDownlightRow(root, x, z + 7.15, 0, 7.04, 7);
-  addRail(root, x, z - tileSize * 0.43, true, 4.25);
-  addRail(root, x, z + tileSize * 0.43, true, 7.45);
-  root.push(createBox("upperWalkway", { width: tileSize, height: 0.35, depth: 3.2 }, new BABYLON.Vector3(x, 3.72, z - 8.5), materials.upperWalkway, false));
-  root.push(createBox("upperWalkwayLip", { width: tileSize, height: 0.22, depth: 0.18 }, new BABYLON.Vector3(x, 3.98, z - 6.84), materials.blackTrim, false));
-  addUndersideLight(root, x, z - 6.95, 3.48, true);
-  root.push(createBox("upperWalkway", { width: tileSize, height: 0.35, depth: 3.2 }, new BABYLON.Vector3(x, 6.95, z + 8.5), materials.upperWalkway, false));
-  root.push(createBox("upperWalkwayLip", { width: tileSize, height: 0.22, depth: 0.18 }, new BABYLON.Vector3(x, 7.2, z + 6.84), materials.blackTrim, false));
-  addUndersideLight(root, x, z + 6.95, 6.72, true);
-  addUpperStorefrontRun(root, x, z - 9.9, true);
-  if (edgeZ) addUpperStorefrontRun(root, x - 9.1, z, false);
-  if (edgeZ && rand > 0.45) addAdBanner(root, x + 6.6, z - Math.sign(district.localZ) * 2.4, Math.PI / 2, rand > 0.62 ? "SALE 50" : "EAT DRINK");
-  if (!edgeX && !edgeZ) {
-    root.push(createBox("atriumVoidHint", { width: 7.6, height: 0.035, depth: 5.8 }, new BABYLON.Vector3(x, 0.082, z), materials.shadowMat, false));
+  const isCenter = district.localX === 0 && district.localZ === 0;
+  const hole = 11;
+
+  // Overhead lighting for this level (the open shaft is lit artificially now).
+  addDownlightRow(root, x, z - 7.6, 0, 5.2, 7);
+  addDownlightRow(root, x, z + 7.6, 0, 5.2, 7);
+
+  if (isCenter) {
+    // The galleria void runs through this tile on every level; rail it off and
+    // drop in the escalators that actually carry the player up a floor.
+    addVoidRails(root, x, z, hole);
+    addEscalator(root, x - 6.5, z - 8.2, levelHeight, -Math.PI / 2); // ascends heading +X over the -Z walkway
+    if (rand > 0.4) addEscalator(root, x + 6.5, z + 8.2, levelHeight, Math.PI / 2); // ascends heading -X over the +Z walkway
+    addUndersideLight(root, x, z - hole / 2 - 0.2, 0.9, true);
+    addUndersideLight(root, x, z + hole / 2 + 0.2, 0.9, true);
+    if (rand > 0.5) addDirectory(root, x + hole / 2 + 1.6, z - hole / 2 - 1.6, Math.PI / 5);
+    if (rand > 0.45) addHangingWayfinder(root, x - hole / 2 - 1.4, z, Math.PI / 2, rand > 0.7 ? "LEVELS" : "UP / DOWN");
+  } else {
+    // Non-void atrium tiles keep a floor circle and centre planting.
     root.push(createCylinder("floorMedallion", { diameter: 5.2, height: 0.035, tessellation: 48 }, new BABYLON.Vector3(x, 0.1, z), materials.floorTrim, false));
     root.push(createCylinder("floorMedallionInset", { diameter: 3.6, height: 0.038, tessellation: 48 }, new BABYLON.Vector3(x, 0.12, z), materials.tileAlt, false));
-    if (rand > 0.2) addReflectingPool(root, x - 5.8, z + 3.2, -0.18);
+    if (rand > 0.4) addReflectingPool(root, x, z, 0);
+    else addPalm(root, x, z, 1.0);
   }
+
+  if (edgeZ && rand > 0.45) addAdBanner(root, x + 6.6, z - Math.sign(district.localZ || 1) * 2.4, Math.PI / 2, rand > 0.62 ? "SALE 50" : "EAT DRINK");
+
+  // Shopfronts line the atrium edges, same as the concourse.
   if (edgeX) {
-    root.push(createBox("atriumShopWall", { width: 0.5, height: 8, depth: tileSize }, new BABYLON.Vector3(x + Math.sign(district.localX) * 10.8, 4, z), materials.whiteWall));
-    buildShop(tileX, tileZ, -Math.sign(district.localX), rand, root);
-    addPanelText(root, "LEVEL 2", new BABYLON.Vector3(x + Math.sign(district.localX) * 10.45, 6.55, z - 5.8), Math.sign(district.localX) > 0 ? -Math.PI / 2 : Math.PI / 2, 1.8, 0.55, "#16191d", "#e7d9ae");
-    addUpperShopGlow(root, x + Math.sign(district.localX) * 10.45, z + 3.8, Math.sign(district.localX) > 0 ? -Math.PI / 2 : Math.PI / 2, rand > 0.5 ? "FASHION" : "DINING");
-    if (rand > 0.52) addElevatorBank(root, x + Math.sign(district.localX) * 10.42, z - 2.4, Math.sign(district.localX) > 0 ? -Math.PI / 2 : Math.PI / 2);
-    if (rand > 0.34) addSecurityCamera(root, x + Math.sign(district.localX) * 9.9, z + 8.0, Math.sign(district.localX) > 0 ? -Math.PI / 2 : Math.PI / 2, 7.4);
+    const sgn = Math.sign(district.localX);
+    const facing = sgn > 0 ? -Math.PI / 2 : Math.PI / 2;
+    root.push(createBox("atriumShopWall", { width: 0.5, height: 5.2, depth: tileSize }, new BABYLON.Vector3(x + sgn * 10.8, 2.5, z), materials.whiteWall));
+    buildShop(tileX, tileZ, -sgn, rand, root);
+    addUpperShopGlow(root, x + sgn * 10.45, z + 3.8, facing, rand > 0.5 ? "FASHION" : "DINING");
+    if (rand > 0.52) addElevatorBank(root, x + sgn * 10.42, z - 2.4, facing);
+    if (rand > 0.34) addSecurityCamera(root, x + sgn * 9.9, z + 8.0, facing, 4.6);
   }
-  if (edgeZ) {
-    addRail(root, x - tileSize * 0.38, z, false, 4.25);
-    addRail(root, x + tileSize * 0.38, z, false, 7.45);
-  }
-  if (district.localX === 0 && district.localZ === 0) {
-    addHangingLight(root, x, z, new BABYLON.Color3(0.72, 0.9, 1));
-    addHangingWayfinder(root, x - 5.5, z - 5.8, Math.PI / 10, "LEVEL 3");
-    addAdBanner(root, x + 5.2, z - 4.2, -0.18, "NOW OPEN");
-    addEscalator(root, x - 7, z + 5, Math.PI / 5);
-    addEscalator(root, x + 7, z - 5, -Math.PI / 5);
-    addEscalatorLanding(root, x - 6.7, z + 8.6, Math.PI / 5);
-    addEscalatorLanding(root, x + 6.7, z - 8.6, -Math.PI / 5);
-    root.push(createSphere("wireGlobe", { diameter: 3.1, segments: 12 }, new BABYLON.Vector3(x, 5.85, z), materials.railGlass, false));
-    const ringA = BABYLON.MeshBuilder.CreateTorus("globeRing", { diameter: 3.35, thickness: 0.03, tessellation: 48 }, scene);
-    ringA.position = new BABYLON.Vector3(x, 5.85, z);
-    ringA.material = materials.chrome;
-    const ringB = ringA.clone("globeRingB");
-    ringB.rotation.x = Math.PI / 2;
-    const ringC = ringA.clone("globeRingC");
-    ringC.rotation.z = Math.PI / 2;
-    root.push(ringA, ringB, ringC);
-    addDirectory(root, x + 7.2, z + 7.2, Math.PI / 5);
-  }
-  if (rand > 0.46) addPalm(root, x + 5.5, z - 5.5, 0.9);
-  if (rand > 0.22) addBench(root, x - 5.8, z + 5.5, Math.PI / 4);
-  if (rand > 0.66) addSoftSeatingIsland(root, x - 4.2, z - 4.8, -0.25);
-  if (rand > 0.34) addPlanter(root, x + 6.4, z + 3.8, 0.9);
-  if (rand > 0.52) addTrashBin(root, x - 7.5, z - 3.8);
+
+  // props — kept on the walkway ring, clear of the void
+  if (rand > 0.46) addPalm(root, x + 8.2, z - 8.2, 0.9);
+  if (rand > 0.22) addBench(root, x - 8.4, z + 6.6, Math.PI / 4);
+  if (rand > 0.66) addSoftSeatingIsland(root, x - 7.8, z - 7.6, -0.25);
+  if (rand > 0.34) addPlanter(root, x + 8.4, z + 3.8, 0.9);
+  if (rand > 0.52) addTrashBin(root, x - 8.6, z - 3.8);
   if (rand > 0.73) addVendingMachine(root, x + 8.0, z - 7.2, -Math.PI / 4, materials.posterRed);
   if (rand > 0.61) addFireExitSign(root, x - 8.8, z + 8.95, 0, "EXIT");
-  if (rand > 0.58) addShopperSilhouette(root, x + 2.5, z + 7.1, -Math.PI / 6);
-  if (rand > 0.18) addScatteredMallClutter(root, x + 1.1, z - 0.8, rand, 3);
-  addChromeColumn(root, x - 8.8, z - 8.8, 4, 8);
-  root.push(createCylinder("columnBase", { diameter: 1.25, height: 0.25, tessellation: 20 }, new BABYLON.Vector3(x - 8.8, 0.14, z - 8.8), materials.blackTrim, false));
-  root.push(createCylinder("columnCap", { diameter: 1.1, height: 0.18, tessellation: 20 }, new BABYLON.Vector3(x - 8.8, 7.86, z - 8.8), materials.blackTrim, false));
-  addChromeColumn(root, x + 8.8, z + 8.8, 4, 8);
-  root.push(createCylinder("columnBase", { diameter: 1.25, height: 0.25, tessellation: 20 }, new BABYLON.Vector3(x + 8.8, 0.14, z + 8.8), materials.blackTrim, false));
-  root.push(createCylinder("columnCap", { diameter: 1.1, height: 0.18, tessellation: 20 }, new BABYLON.Vector3(x + 8.8, 7.86, z + 8.8), materials.blackTrim, false));
+  if (rand > 0.58) addShopperSilhouette(root, x + 8.5, z + 7.1, -Math.PI / 6);
+  if (rand > 0.18) addScatteredMallClutter(root, x + 7.5, z + 7.5, rand, 3);
+
+  // corner columns, scaled to one storey
+  for (const [cxs, czs] of [[-1, -1], [1, 1]]) {
+    const cx = x + cxs * 8.8;
+    const cz = z + czs * 8.8;
+    addChromeColumn(root, cx, cz, 2.7, 5.4);
+    root.push(createCylinder("columnBase", { diameter: 1.25, height: 0.25, tessellation: 20 }, new BABYLON.Vector3(cx, 0.14, cz), materials.blackTrim, false));
+    root.push(createCylinder("columnCap", { diameter: 1.1, height: 0.18, tessellation: 20 }, new BABYLON.Vector3(cx, 5.3, cz), materials.blackTrim, false));
+  }
 }
 
 function buildFoodCourt(root, tileX, tileZ, district, rand) {
   const x = tileX * tileSize;
-  const z = tileZ * tileSize;
-  addCeiling(root, x, z, true);
-  addDownlightRow(root, x, z - 5.8, 0, 7.25, 5);
-  addDownlightRow(root, x, z + 5.8, 0, 7.25, 5);
+  const z = tileSize * tileZ;
+  addCeiling(root, x, z);
+  addDownlightRow(root, x, z - 5.8, 0, 5.2, 5);
+  addDownlightRow(root, x, z + 5.8, 0, 5.2, 5);
   if (Math.abs(district.localX) === 2 || Math.abs(district.localZ) === 2) {
     root.push(createBox("foodCounter", { width: 8, height: 2.6, depth: 2.2 }, new BABYLON.Vector3(x, 1.3, z + 8.7), materials.shopDark));
     addFoodCourtBulkhead(root, x, z + 7.5, rand > 0.5 ? "FRESH FOOD" : "COFFEE BAR");
@@ -1267,44 +1639,59 @@ function buildFoodCourt(root, tileX, tileZ, district, rand) {
     if (rand > 0.1) addScatteredMallClutter(root, x, z, rand, 6);
     if (district.localX === 0 && district.localZ === 0) {
       addPalm(root, x, z, 1.15);
-      addHangingLight(root, x - 5, z + 5, new BABYLON.Color3(1, 0.88, 0.55));
       addDirectory(root, x + 6.5, z - 6.5, -Math.PI / 8);
     }
   }
-  addRail(root, x, z - tileSize * 0.45, true, 4.1);
 }
 
-function generateTile(tileX, tileZ) {
-  const key = `${tileX},${tileZ}`;
+function generateTile(tileX, tileZ, level) {
+  const key = `${tileX},${tileZ},${level}`;
   if (mall.has(key)) return;
   const root = [];
   const x = tileX * tileSize;
   const z = tileZ * tileSize;
   const rand = seeded(tileX, tileZ);
   const district = districtInfo(tileX, tileZ);
+  const isAtriumCore = district.type === "atrium" && district.localX === 0 && district.localZ === 0;
 
-  addFloorPattern(root, x, z, district);
+  // Floor: solid almost everywhere, but the atrium core is an open shaft so the
+  // stacked levels read as a galleria running endlessly up and down.
+  if (isAtriumCore) addAtriumVoidFloor(root, x, z, 11);
+  else addFloorPattern(root, x, z, district);
+
   if (district.type === "atrium") buildAtrium(root, tileX, tileZ, district, rand);
   if (district.type === "foodCourt") buildFoodCourt(root, tileX, tileZ, district, rand);
   if (district.type === "concourse") {
-    addCeiling(root, x, z, false);
+    addCeiling(root, x, z);
     buildConcourse(root, tileX, tileZ, rand);
   }
 
-  if (rand > 0.72) {
+  if (rand > 0.72 && !isAtriumCore) {
     const trunk = createCylinder("fakeTree", { diameter: 0.35, height: 2.4 }, new BABYLON.Vector3(x + 2.5, 1.2, z + 2.5), materials.wood);
     const leaves = createCylinder("plasticPlant", { diameterTop: 0.2, diameterBottom: 2.2, height: 2.4 }, new BABYLON.Vector3(x + 2.5, 2.8, z + 2.5), materials.plant, false);
     addInteractable(trunk, "loot", "Break fake tree", { wood: 3 });
     root.push(trunk, leaves);
   }
 
-  if (rand > 0.68 || (district.localX === 0 && district.localZ === 0)) {
-    const light = new BABYLON.PointLight("tubeLight", new BABYLON.Vector3(x, district.type === "concourse" ? 4.35 : 8.6, z), scene);
+  if (rand > 0.82 || isAtriumCore) {
+    const light = new BABYLON.PointLight("tubeLight", new BABYLON.Vector3(x, 4.6, z), scene);
     light.diffuse = new BABYLON.Color3(1, 0.86, 0.58);
-    light.intensity = 0.48 + rand * 0.28;
-    light.range = district.type === "concourse" ? 13 : 24;
+    light.intensity = 0.46 + rand * 0.26;
+    light.range = 9;
     root.push(light);
   }
+
+  // Lift the whole tile to its floor. Setting .parent keeps each node's local
+  // position, so world height = local + level*levelHeight — one offset point
+  // instead of threading a height through every single mesh.
+  const levelNode = new BABYLON.TransformNode(`level_${key}`, scene);
+  levelNode.position.y = level * levelHeight;
+  levelNode._isLevelNode = true;
+  for (const item of root) {
+    if (item && item.parent === null) item.parent = levelNode;
+  }
+  root.push(levelNode);
+
   finalizeTile(root);
   mall.set(key, root);
 }
@@ -1312,24 +1699,35 @@ function generateTile(tileX, tileZ) {
 function updateMall() {
   const tx = Math.round(camera.position.x / tileSize);
   const tz = Math.round(camera.position.z / tileSize);
+  const tl = Math.round(camera.position.y / levelHeight);
   for (let x = tx - renderRadius; x <= tx + renderRadius; x++) {
     for (let z = tz - renderRadius; z <= tz + renderRadius; z++) {
-      generateTile(x, z);
+      for (let l = tl - vRadiusDown; l <= tl + vRadiusUp; l++) {
+        generateTile(x, z, l);
+      }
     }
   }
-  for (const [key, meshes] of mall) {
-    const [x, z] = key.split(",").map(Number);
-    if (Math.abs(x - tx) > renderRadius + 1 || Math.abs(z - tz) > renderRadius + 1) {
-      meshes.forEach((mesh) => {
-        interactables.delete(mesh);
-        if (mesh.metadata?.disposableMaterial && mesh.material) {
-          mesh.material.diffuseTexture?.dispose();
-          mesh.material.dispose();
-        }
-        mesh.dispose();
-      });
-      mall.delete(key);
-    }
+  for (const [key, items] of mall) {
+    const [x, z, l] = key.split(",").map(Number);
+    const outOfRange =
+      Math.abs(x - tx) > renderRadius + 1 ||
+      Math.abs(z - tz) > renderRadius + 1 ||
+      l > tl + vRadiusUp + 1 ||
+      l < tl - vRadiusDown - 1;
+    if (!outOfRange) continue;
+    items.forEach((item) => {
+      if (item._isLevelNode) return; // disposed last, without recursing
+      interactables.delete(item);
+      if (shadowGen && item._isHeroCaster) shadowGen.removeShadowCaster(item);
+      if (item.metadata?.disposableMaterial && item.material) {
+        item.material.diffuseTexture?.dispose();
+        item.material.dispose();
+      }
+      item.dispose();
+    });
+    const node = items[items.length - 1];
+    if (node && node._isLevelNode) node.dispose(true);
+    mall.delete(key);
   }
 }
 
@@ -1456,7 +1854,7 @@ engine.runRenderLoop(() => {
   state.battery = Math.max(0, state.battery - delta * 0.38);
   state.hunger = Math.max(0, state.hunger - delta * 0.42);
   state.warmth = Math.max(0, Math.min(100, state.warmth + (isNearCamp() ? delta * 6 : -delta * 0.62)));
-  hemi.intensity = 0.46 + (state.battery / 100) * 0.18;
+  hemi.intensity = 0.3 + (state.battery / 100) * 0.12;
   if (state.hunger <= 0 || state.warmth <= 0) {
     camera.speed = 0.07;
     ui.prompt.textContent = "You are fading. Find food or warmth.";
