@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Endless Mall Survival</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <div id="hud">
+      <div class="status">
+        <div>
+          <span>Warmth</span>
+          <meter id="warmth" min="0" max="100" value="100"></meter>
+        </div>
+        <div>
+          <span>Hunger</span>
+          <meter id="hunger" min="0" max="100" value="100"></meter>
+        </div>
+        <div>
+          <span>Battery</span>
+          <meter id="battery" min="0" max="100" value="100"></meter>
+        </div>
+      </div>
+      <div class="inventory">
+        <div><strong>Wood</strong><span id="wood">0</span></div>
+        <div><strong>Scrap</strong><span id="scrap">0</span></div>
+        <div><strong>Food</strong><span id="food">0</span></div>
+      </div>
+      <div id="prompt">Click to enter the mall</div>
+      <div id="recipe">1: Barricade  2: Camp  E: Scavenge  F: Eat</div>
+    </div>
+    <div id="crosshair"></div>
+    <div id="notice"></div>
+    <div id="start">
+      <h1>Endless Mall Survival</h1>
+      <p>There are no exits. There are only bright corridors, stocked shops, polished tiles, and the quiet of a mall with nobody left inside.</p>
+      <button id="startButton">Enter</button>
+    </div>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
